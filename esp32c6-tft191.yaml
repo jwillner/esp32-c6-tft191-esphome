@@ -1,0 +1,275 @@
+esphome:
+  name: esphome-191tft
+  friendly_name: ESP32-C6 TFT 1.9"
+
+esp32:
+  board: esp32-c6-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+# ✅ Home Assistant API (modern & stabil)
+api:
+  encryption:
+    key: "hdyLunnvJ/hAHw/5HxPR40T/W7vP3kOVkaJr5zABPTk="
+
+ota:
+  - platform: esphome
+    password: "85268526"
+
+wifi:
+  ssid: !secret ssid
+  password: !secret password
+  reboot_timeout: 0s
+  ap:
+    ssid: "esphome-191tft-fallback"
+    password: "12345678"
+
+captive_portal:
+
+web_server:
+  port: 80
+  auth:
+    username: "admin"
+    password: "85268526"
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: ip_addr
+
+# ----------------------------
+# 1-Wire für DS18B20 (DATA an GPIO2, 4.7k Pullup nach 3V3)
+# ----------------------------
+one_wire:
+  - platform: gpio
+    pin: GPIO2
+
+# ----------------------------
+# Globale Zustände
+# ----------------------------
+globals:
+  - id: temp_request_on
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+# ----------------------------
+# Schaltschwellen als HA-Entities (änderbar in Home Assistant!)
+# ----------------------------
+number:
+  - platform: template
+    id: temp_on
+    name: "Schaltschwelle EIN (°C)"
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 80
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+
+  - platform: template
+    id: temp_off
+    name: "Schaltschwelle AUS (°C)"
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 100
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 50
+
+# ----------------------------
+# Sensoren
+# ----------------------------
+sensor:
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi RSSI"
+    update_interval: 10s
+
+  # stabiler als "copy"
+  - platform: template
+    id: wifi_percent
+    name: "WiFi Signal %"
+    unit_of_measurement: "%"
+    update_interval: 10s
+    lambda: |-
+      float r = id(wifi_rssi).state;
+      float p = 2.0f * (r + 100.0f);
+      if (p < 0.0f) p = 0.0f;
+      if (p > 100.0f) p = 100.0f;
+      return p;
+
+  - platform: dallas_temp
+    id: temp_ds18b20
+    name: "Temperatur"
+    update_interval: 5s
+    on_value:
+      then:
+        - lambda: |-
+            // Hysterese:
+            // Relais-Anforderung EIN wenn <= temp_on
+            // Relais-Anforderung AUS wenn >= temp_off
+            if (!isnan(x)) {
+              if (x <= id(temp_on).state)  id(temp_request_on) = true;
+              if (x >= id(temp_off).state) id(temp_request_on) = false;
+            }
+        - script.execute: apply_relay_logic
+
+# ----------------------------
+# Binary Sensoren
+# ----------------------------
+binary_sensor:
+  # ✅ zeigt in HA, ob ESP online ist
+  - platform: status
+    name: "ESP32 Status"
+
+  # Hardware-Schalter (nach 3V3) an GPIO1
+  # HIGH = Relais-Sperre (manuell AUS)
+  - platform: gpio
+    id: off_switch
+    name: "Relais Sperre (Schalter)"
+    pin:
+      number: GPIO1
+      mode:
+        input: true
+        pulldown: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_state:
+      then:
+        - script.execute: apply_relay_logic
+
+  # ✅ TempReq als Entität in HA sichtbar
+  - platform: template
+    id: temp_req
+    name: "Relais Anforderung (TempReq)"
+    lambda: |-
+      return id(temp_request_on);
+
+# ----------------------------
+# Relais-Ausgang an GPIO3 (über NPN-Transistor)
+# ----------------------------
+switch:
+  - platform: gpio
+    id: relay
+    name: "Relais (Ausgang)"
+    pin: GPIO3
+    restore_mode: ALWAYS_OFF
+    # Falls dein Relais LOW-aktiv ist, nutze stattdessen:
+    # pin:
+    #   number: GPIO3
+    #   inverted: true
+
+# ----------------------------
+# Logik:
+# Relais EIN nur wenn (Temp verlangt EIN) UND (Schalter sperrt NICHT)
+# ----------------------------
+script:
+  - id: apply_relay_logic
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(temp_request_on) && !id(off_switch).state;
+          then:
+            - switch.turn_on: relay
+          else:
+            - switch.turn_off: relay
+
+# ----------------------------
+# TFT Backlight (Waveshare 1.9" = active LOW) an GPIO15
+# ----------------------------
+output:
+  - platform: gpio
+    pin: GPIO15
+    id: bl_raw
+    inverted: true
+
+light:
+  - platform: binary
+    name: "TFT Backlight"
+    output: bl_raw
+    id: tft_backlight
+    restore_mode: ALWAYS_ON
+
+# ----------------------------
+# SPI Bus fürs TFT
+# ----------------------------
+spi:
+  id: tft_spi
+  clk_pin: GPIO5
+  mosi_pin: GPIO4
+
+# ----------------------------
+# Fonts
+# ----------------------------
+font:
+  - file: "gfonts://Roboto"
+    id: font_big
+    size: 20
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 16
+
+# ----------------------------
+# Display ST7789 (Waveshare 1.9", 170x320)
+# ----------------------------
+display:
+  - platform: st7789v
+    model: Custom
+    spi_id: tft_spi
+    cs_pin: GPIO7
+    dc_pin: GPIO6
+    reset_pin: GPIO14
+
+    width: 170
+    height: 320
+    offset_width: 0
+    offset_height: 35
+    rotation: 270
+
+    update_interval: 1s
+
+    lambda: |-
+      auto BLACK = Color(0, 0, 0);
+      auto WHITE = Color(255, 255, 255);
+      auto GREEN = Color(0, 180, 0);
+
+      it.fill(BLACK);
+
+      it.printf(10, 15, id(font_big), GREEN, "TFT OK");
+
+      it.printf(10, 45, id(font_small), WHITE,
+                "IP: %s", id(ip_addr).state.c_str());
+
+      it.printf(10, 70, id(font_small), WHITE,
+                "WLAN: %.0f dBm (%.0f%%)",
+                id(wifi_rssi).state,
+                id(wifi_percent).state);
+
+      it.printf(10, 95, id(font_small), WHITE,
+                "Sperre: %s  TempReq: %s",
+                id(off_switch).state ? "ON" : "OFF",
+                id(temp_request_on) ? "ON" : "OFF");
+
+      it.printf(10, 120, id(font_small), WHITE,
+                "Relais: %s", id(relay).state ? "AN" : "AUS");
+
+      if (!isnan(id(temp_ds18b20).state)) {
+        it.printf(10, 145, id(font_small), WHITE,
+                  "Temp: %.1f C", id(temp_ds18b20).state);
+      } else {
+        it.printf(10, 145, id(font_small), WHITE,
+                  "Temp: --.- C");
+      }
+
+button:
+  - platform: restart
+    name: "ESP32 Reboot"
